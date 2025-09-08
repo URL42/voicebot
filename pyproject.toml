@@ -1,0 +1,16 @@
+[project]
+name = "voicebot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+python-dotenv = "*"
+paho-mqtt = "*"
+sounddevice = "*"
+webrtcvad-wheels = "*"
+numpy = "*"
+faster-whisper = "*"
+requests = "*"
+piper = "*"

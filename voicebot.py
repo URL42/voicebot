@@ -3,7 +3,8 @@
 Voicebot with:
 - ALSA capture (no PortAudio needed), robust hw→plughw fallback
 - Auto-detect AIRHUG (if ALSA_DEVICE=auto or unset)
-- Wakeword gate (configurable), VAD-based end-of-utterance
+- Always-on wakeword option + sensitivity (low/medium/high)
+- VAD-based end-of-utterance
 - Ollama chat, faster-whisper STT
 - Piper TTS spoken replies via ALSA playback
 - Optional MQTT presence trigger & memory
@@ -51,20 +52,28 @@ USE_ALSA_CAPTURE      = os.getenv("USE_ALSA_CAPTURE", "1") == "1"
 ALSA_DEVICE           = os.getenv("ALSA_DEVICE", "").strip()        # e.g. "plughw:2,0" or "auto"
 VOICEBOT_PLAY_DEVICE  = os.getenv("VOICEBOT_PLAY_DEVICE", "").strip()
 
+# ---- Wakeword & window ----
 REQUIRE_WAKEWORD      = os.getenv("REQUIRE_WAKEWORD", "0") == "1"
+WAKE_ALWAYS_ON        = os.getenv("WAKE_ALWAYS_ON", "0") == "1"     # NEW
+WAKE_SENSITIVITY      = os.getenv("WAKE_SENSITIVITY", "medium").strip().lower()  # NEW: low|medium|high
+WAKE_WINDOW_SEC       = float(os.getenv("WAKE_WINDOW_SEC", "10"))   # NEW
 WAKEWORD              = os.getenv("WAKEWORD", "hey tars").strip()
 WAKEWORD_TIMEOUT      = float(os.getenv("WAKEWORD_TIMEOUT", "45"))
 WAKE_DEBUG_WAV        = os.getenv("WAKE_DEBUG_WAV", "0") == "1"
 
+# Ollama / LLM
 OLLAMA_BASE_URL       = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL          = os.getenv("OLLAMA_MODEL", "llama3:8b-instruct")
 SYSTEM_PROMPT         = os.getenv("SYSTEM_PROMPT", "You are a concise, helpful assistant. Answer succinctly and politely.")
 
+# Memory
 ENABLE_MEMORY         = os.getenv("ENABLE_MEMORY", "1") == "1"
 MEMORY_FILE           = os.getenv("MEMORY_FILE", "memories.json")
 
+# Ops
 OFFLINE_MODE          = os.getenv("OFFLINE_MODE", "0") == "1"
 
+# Bluetooth / Speaker
 AUTO_BT_CONNECT       = os.getenv("AUTO_BT_CONNECT", "0") == "1"
 BT_SPEAKER_MAC        = os.getenv("BT_SPEAKER_MAC", "").strip()
 BT_CONNECT_RETRIES    = int(os.getenv("BT_CONNECT_RETRIES", "5"))
@@ -73,7 +82,7 @@ BT_PROFILE            = os.getenv("BT_PROFILE", "a2dp_sink").strip()
 
 # Piper TTS
 PIPER_BINARY          = os.getenv("PIPER_BINARY", "piper")
-PIPER_VOICE           = os.getenv("PIPER_VOICE", "").strip()  # e.g., /home/anthony/voices/en_US-amy-low.onnx
+PIPER_VOICE           = os.getenv("PIPER_VOICE", "").strip()  # e.g., /home/anthony/voices/TARS.onnx
 PIPER_LENGTH_SCALE    = os.getenv("PIPER_LENGTH_SCALE", "1.0")
 PIPER_NOISE_SCALE     = os.getenv("PIPER_NOISE_SCALE", "0.667")
 PIPER_NOISE_W         = os.getenv("PIPER_NOISE_W", "0.8")
@@ -433,19 +442,35 @@ def _lev(a: str, b: str) -> int:
             prev = cur
     return dp[n]
 
-def _match_wakeword(text: str, wake: str, aliases: List[str] | None = None) -> bool:
+# Sensitivity → fuzzy tolerance (smaller = stricter)
+_SENS_FUZZ = {
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+}
+def _match_wake(text: str, wake: str, sensitivity: str, aliases: List[str] | None = None) -> bool:
     nt = _norm(text)
     nw = _norm(wake)
+    fuzz = _SENS_FUZZ.get(sensitivity, 2)
     cands = [nw] + ([_norm(a) for a in (aliases or [])])
+
+    # Exact/substring match first
     for w in cands:
         if w and w in nt:
             return True
-    short = nw.split()[-1] if nw else ""
-    if short and short in nt:
+
+    # Allow last token alone for medium/high only
+    last = nw.split()[-1] if nw else ""
+    if sensitivity != "low" and last and last in nt:
         return True
-    for w in cands + [short]:
-        if w and _lev(nt, w) <= 2:
+
+    # Fuzzy edit-distance match
+    for w in cands + ([last] if last else []):
+        if not w:
+            continue
+        if _lev(nt, w) <= fuzz:
             return True
+
     return False
 
 def _strip_wake(text: str, wake: str) -> str:
@@ -461,6 +486,15 @@ def _strip_wake(text: str, wake: str) -> str:
 
 # ---------------- Session ----------------
 def voice_session():
+    """
+    Always-on state machine:
+      - If REQUIRE_WAKEWORD and WAKE_ALWAYS_ON:
+          * Continuously listen for utterances.
+          * When a wake is detected, open an ACCEPT window for WAKE_WINDOW_SEC.
+          * Commands in that window go to LLM; window extends on each command.
+      - If REQUIRE_WAKEWORD and not ALWAYS_ON: old behavior (single wake stage).
+      - If not REQUIRE_WAKEWORD: continuous conversation.
+    """
     global session_active, last_activity_ts
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     convo_log: List[str] = []
@@ -496,8 +530,23 @@ def voice_session():
 def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
     global session_active
 
-    # ---- Wake stage (optional) ----
-    if REQUIRE_WAKEWORD:
+    # --- Mode/state for always-on ---
+    accepting = False
+    accept_until = 0.0
+
+    def begin_accept_window(now: float):
+        nonlocal accepting, accept_until
+        accepting = True
+        accept_until = now + WAKE_WINDOW_SEC
+        print(f"[Wake] WAKE detected → accepting for {WAKE_WINDOW_SEC}s")
+
+    def maybe_extend_window(now: float, extend_sec: float = None):
+        nonlocal accept_until
+        extend = WAKE_WINDOW_SEC if extend_sec is None else extend_sec
+        accept_until = max(accept_until, now + extend)
+
+    # --- Legacy single-shot wake mode ---
+    if REQUIRE_WAKEWORD and not WAKE_ALWAYS_ON:
         print(f"[Wakeword] Say: '{WAKEWORD}'")
         start_ts = time.time()
         while session_active:
@@ -506,7 +555,6 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                 session_active = False
                 return
 
-            # ~0.7s min voiced + 0.2s pad helps short wake phrases
             pcm = record_until_silence(min_ms=700, pad_ms=200)
             if not session_active or not pcm:
                 continue
@@ -524,7 +572,8 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                 continue
 
             print(f"[Wakeword->ASR] {text}")
-            if _match_wakeword(text, WAKEWORD, aliases=["hey tars", "tars", "hey, tars", "hey-tars"]):
+            if _match_wake(text, WAKEWORD, WAKE_SENSITIVITY,
+                           aliases=["hey tars", "tars", "hey, tars", "hey-tars"]):
                 cleaned = _strip_wake(text, WAKEWORD)
                 if cleaned:
                     print(f"[User] {cleaned}")
@@ -537,7 +586,7 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                     speak(reply)
                 break
 
-    # ---- Conversational loop ----
+    # --- Always-on or normal conversation loop ---
     idle_tries = 0
     while session_active:
         pcm = record_until_silence()
@@ -555,6 +604,57 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
             print("[ASR] empty transcript")
             continue
 
+        now = time.time()
+
+        # If wakeword is required, decide whether this utterance should trigger or be treated as a command
+        if REQUIRE_WAKEWORD:
+            # Always-on: continuously look for wake; otherwise, in legacy mode we've already passed wake stage
+            if WAKE_ALWAYS_ON:
+                if not accepting:
+                    # Look for a wake in this utterance
+                    if _match_wake(text, WAKEWORD, WAKE_SENSITIVITY,
+                                   aliases=["hey tars", "tars", "hey, tars", "hey-tars"]):
+                        begin_accept_window(now)
+                        cleaned = _strip_wake(text, WAKEWORD)
+                        # If user said "hey tars, <command>" handle immediately
+                        if cleaned:
+                            print(f"[User] {cleaned}")
+                            convo_log.append(f"User: {cleaned}")
+                            messages.append({"role": "user", "content": cleaned})
+                            reply = _ollama_chat(messages)
+                            print(f"[Bot] {reply}")
+                            convo_log.append(f"Bot: {reply}")
+                            messages.append({"role": "assistant", "content": reply})
+                            speak(reply)
+                            maybe_extend_window(now)  # keep window open for follow-up
+                        continue  # go back to listening (window is open)
+                    else:
+                        # Not a wake; ignore in wake-wait state
+                        print(f"[WakeWait] heard non-wake utterance: {text}")
+                        continue
+                else:
+                    # We are within the accept window
+                    if now > accept_until:
+                        accepting = False
+                        print("[Wake] window expired → waiting for wake")
+                        # Fall through to next loop
+                        continue
+                    # Treat the utterance as a command (strip wake if user repeats it)
+                    cleaned = _strip_wake(text, WAKEWORD)
+                    user_text = cleaned if cleaned else text
+                    print(f"[User] {user_text}")
+                    convo_log.append(f"User: {user_text}")
+                    messages.append({"role": "user", "content": user_text})
+                    reply = _ollama_chat(messages)
+                    print(f"[Bot] {reply}")
+                    convo_log.append(f"Bot: {reply}")
+                    messages.append({"role": "assistant", "content": reply})
+                    speak(reply)
+                    maybe_extend_window(now)  # extend the window with each command
+                    continue
+            # else: legacy single-shot path already handled; just converse below
+
+        # If wakeword not required, or in legacy mode after initial wake:
         print(f"[User] {text}")
         convo_log.append(f"User: {text}")
         messages.append({"role": "user", "content": text})

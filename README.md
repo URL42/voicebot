@@ -39,5 +39,37 @@ A local voice assistant inspired by **TARS from Interstellar**, running on Linux
    ```bash
    git clone https://github.com/YOUR_USERNAME/voicebot.git
    cd voicebot
+   ```
 
-2. 
+2.  Configure Git (one-time per machine):
+   ```bash
+   git config --global user.name "URL42"
+   git config --global user.email "your@email.com"
+   git config --global init.defaultBranch main
+   ```
+
+3. Initialize the local repository:
+   ```bash
+   cd ~/voicebot
+   git init
+   git add .
+   git commit -m "Initial commit: working TARS voicebot"
+   ```
+
+4. Create the GitHub repository:
+
+- Go to [https://github.com/new](https://github.com/new)  
+- Set **Repository name**: `voicebot`  
+- Leave it empty (no README, .gitignore, or license)  
+- Click **Create repository**  
+- Copy the HTTPS URL (e.g., `https://github.com/URL42/voicebot.git`)
+
+5. Add the remote:
+
+```bash
+git remote remove origin 2>/dev/null || true
+git remote add origin https://github.com/URL42/voicebot.git
+git remote -v
+```
+
+6. 

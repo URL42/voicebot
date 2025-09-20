@@ -8,6 +8,9 @@ Voicebot with:
 - Ollama chat, faster-whisper STT
 - Piper TTS spoken replies via ALSA playback
 - Optional MQTT presence trigger & memory
+- Barge-in (interrupt TTS on user speech; can be disabled via env)
+- <think>…</think> sanitizer to hide chain-of-thought
+- Keeps wake accept window open briefly **after TTS** for natural follow-ups
 """
 
 import os
@@ -21,7 +24,7 @@ import threading
 import subprocess
 import datetime
 import tempfile
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 
 import numpy as np
 import webrtcvad
@@ -41,8 +44,8 @@ MQTT_PASS             = os.getenv("MQTT_PASS") or None
 MQTT_PRESENCE_TOPIC   = os.getenv("MQTT_PRESENCE_TOPIC", "vision/frontdesk/presence")
 
 INPUT_DEVICE_INDEX    = int(os.getenv("INPUT_DEVICE_INDEX", "-1"))  # PortAudio fallback only
-VAD_AGGRESSIVENESS    = int(os.getenv("VAD_AGGRESSIVENESS", "1"))
-MAX_SILENCE_SECONDS   = float(os.getenv("MAX_SILENCE_SECONDS", "1.2"))
+VAD_AGGRESSIVENESS    = int(os.getenv("VAD_AGGRESSIVENESS", "2"))
+MAX_SILENCE_SECONDS   = float(os.getenv("MAX_SILENCE_SECONDS", "0.7"))
 SESSION_IDLE_TIMEOUT  = float(os.getenv("SESSION_IDLE_TIMEOUT", "45"))
 SAMPLE_RATE           = 16000
 FRAME_MS              = 30
@@ -54,17 +57,39 @@ VOICEBOT_PLAY_DEVICE  = os.getenv("VOICEBOT_PLAY_DEVICE", "").strip()
 
 # ---- Wakeword & window ----
 REQUIRE_WAKEWORD      = os.getenv("REQUIRE_WAKEWORD", "0") == "1"
-WAKE_ALWAYS_ON        = os.getenv("WAKE_ALWAYS_ON", "0") == "1"     # NEW
-WAKE_SENSITIVITY      = os.getenv("WAKE_SENSITIVITY", "medium").strip().lower()  # NEW: low|medium|high
-WAKE_WINDOW_SEC       = float(os.getenv("WAKE_WINDOW_SEC", "10"))   # NEW
+WAKE_ALWAYS_ON        = os.getenv("WAKE_ALWAYS_ON", "0") == "1"
+WAKE_SENSITIVITY      = os.getenv("WAKE_SENSITIVITY", "medium").strip().lower()  # low|medium|high
+WAKE_WINDOW_SEC       = float(os.getenv("WAKE_WINDOW_SEC", "10"))
+POST_TTS_ACCEPT_SEC   = float(os.getenv("POST_TTS_ACCEPT_SEC", "4"))  # keep window open after TTS
 WAKEWORD              = os.getenv("WAKEWORD", "hey tars").strip()
 WAKEWORD_TIMEOUT      = float(os.getenv("WAKEWORD_TIMEOUT", "45"))
-WAKE_DEBUG_WAV        = os.getenv("WAKE_DEBUG_WAV", "0") == "1"
+WAKE_DEBUG_WAV        = os.getenv("WAKE_DEBUG_WAV", "0") == "1"  # <-- fixed
 
 # Ollama / LLM
 OLLAMA_BASE_URL       = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL          = os.getenv("OLLAMA_MODEL", "llama3:8b-instruct")
-SYSTEM_PROMPT         = os.getenv("SYSTEM_PROMPT", "You are a concise, helpful assistant. Answer succinctly and politely.")
+OLLAMA_MODEL          = os.getenv("OLLAMA_MODEL", "llama3.2:3b-instruct")
+SYSTEM_PROMPT         = os.getenv(
+    "SYSTEM_PROMPT",
+    "You are TARS. Reply concisely and only with the final answer. "
+    "NEVER include chain-of-thought, analysis, or <think> blocks."
+)
+
+# LLM decoding/latency controls
+LLM_MAX_TOKENS        = int(os.getenv("LLM_MAX_TOKENS", "100"))
+LLM_TEMP              = float(os.getenv("LLM_TEMP", "0.4"))
+LLM_TOP_P             = float(os.getenv("LLM_TOP_P", "0.9"))
+LLM_REPEAT_PENALTY    = float(os.getenv("LLM_REPEAT_PENALTY", "1.05"))
+LLM_CTX               = int(os.getenv("LLM_CTX", "2048"))
+
+# Whisper / STT
+WHISPER_SIZE          = os.getenv("WHISPER_SIZE", "tiny.en")      # tiny.en, base.en, small.en...
+WHISPER_DEVICE        = os.getenv("WHISPER_DEVICE", "auto")       # "auto", "cuda", "cpu"
+WHISPER_COMPUTE       = os.getenv("WHISPER_COMPUTE", "int8")      # "int8", "int8_float32", "float16", "float32"
+ASR_LANGUAGE          = os.getenv("ASR_LANGUAGE", "en")
+
+# Barge-in (defaults OFF per your preference now)
+ALLOW_BARGE_IN        = os.getenv("ALLOW_BARGE_IN", "0") == "1"
+BARGE_IN_FRAMES       = int(os.getenv("BARGE_IN_FRAMES", "10"))   # only used if barge-in enabled
 
 # Memory
 ENABLE_MEMORY         = os.getenv("ENABLE_MEMORY", "1") == "1"
@@ -83,7 +108,7 @@ BT_PROFILE            = os.getenv("BT_PROFILE", "a2dp_sink").strip()
 # Piper TTS
 PIPER_BINARY          = os.getenv("PIPER_BINARY", "piper")
 PIPER_VOICE           = os.getenv("PIPER_VOICE", "").strip()  # e.g., /home/anthony/voices/TARS.onnx
-PIPER_LENGTH_SCALE    = os.getenv("PIPER_LENGTH_SCALE", "1.0")
+PIPER_LENGTH_SCALE    = os.getenv("PIPER_LENGTH_SCALE", "0.9")
 PIPER_NOISE_SCALE     = os.getenv("PIPER_NOISE_SCALE", "0.667")
 PIPER_NOISE_W         = os.getenv("PIPER_NOISE_W", "0.8")
 
@@ -93,8 +118,20 @@ last_activity_ts: float = 0.0
 audio_q: "queue.Queue[bytes]" = queue.Queue()
 vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
+# ---- Output sanitization: remove chain-of-thought / <think> blocks ----
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+def clean_response(text: str) -> str:
+    if not text:
+        return ""
+    text = _THINK_RE.sub("", text)
+    # Remove obvious reasoning prefixes at line starts
+    lines = [ln for ln in text.splitlines() if not ln.strip().lower().startswith(("thought", "reason", "analysis"))]
+    text = "\n".join(lines).strip()
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
 print("Loading Whisper model...")
-whisper_model = WhisperModel("base", device="auto", compute_type="auto")
+whisper_model = WhisperModel(WHISPER_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
 
 # ---------------- Helpers ----------------
 def sh(cmd: list[str], check: bool = False):
@@ -127,11 +164,27 @@ def bt_autoconnect() -> None:
         print(f"[BT] Error: {e}")
 
 def _ollama_chat(msgs: List[Dict[str, str]]) -> str:
+    """
+    Use concise decoding options and strip any <think> leakage.
+    """
     url = f"{OLLAMA_BASE_URL}/api/chat"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": msgs,
+        "stream": False,
+        "options": {
+            "num_predict": LLM_MAX_TOKENS,
+            "temperature": LLM_TEMP,
+            "top_p": LLM_TOP_P,
+            "repeat_penalty": LLM_REPEAT_PENALTY,
+            "num_ctx": LLM_CTX,
+        },
+    }
     try:
-        r = requests.post(url, json={"model": OLLAMA_MODEL, "messages": msgs, "stream": False}, timeout=120)
+        r = requests.post(url, json=payload, timeout=60)
         r.raise_for_status()
-        return (r.json().get("message", {}) or {}).get("content", "").strip()
+        raw = (r.json().get("message", {}) or {}).get("content", "").strip()
+        return clean_response(raw)
     except Exception as e:
         return f"[error] Ollama API: {e}"
 
@@ -370,7 +423,14 @@ def transcribe(pcm16: bytes) -> str:
     if not pcm16:
         return ""
     audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
-    segments, _ = whisper_model.transcribe(audio, vad_filter=False)
+    segments, _ = whisper_model.transcribe(
+        audio,
+        vad_filter=False,                 # we already gate with WebRTC VAD
+        language=ASR_LANGUAGE,            # lock language for speed/accuracy
+        beam_size=1,                      # greedy is fastest
+        condition_on_previous_text=False, # don't spend time linking segments
+        without_timestamps=True,
+    )
     return "".join(seg.text for seg in segments).strip()
 
 # ---------------- TTS (Piper) ----------------
@@ -411,7 +471,38 @@ def play_wav(path: str):
     if dev:
         cmd[1:1] = ["-D", dev]
     print("🔊 Playing:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+
+    proc = subprocess.Popen(cmd)
+    if not ALLOW_BARGE_IN:
+        proc.wait()
+        return
+
+    # Interrupt if we detect speech for BARGE_IN_FRAMES consecutive frames
+    consecutive = 0
+    try:
+        while proc.poll() is None:
+            time.sleep(FRAME_MS / 1000.0)
+            # Non-blocking check of mic queue for frames; we'll consume a few here
+            try:
+                chunk = audio_q.get_nowait()
+            except queue.Empty:
+                continue
+
+            for i in range(0, len(chunk), FRAME_BYTES):
+                frame = chunk[i:i + FRAME_BYTES]
+                if len(frame) < FRAME_BYTES:
+                    break
+                if vad.is_speech(frame, SAMPLE_RATE):
+                    consecutive += 1
+                    if consecutive >= BARGE_IN_FRAMES:
+                        print("[BargeIn] User speaking → interrupting TTS")
+                        proc.terminate()
+                        return
+                else:
+                    consecutive = 0
+    finally:
+        if proc.poll() is None:
+            proc.wait()
 
 def speak(text: str):
     wav = synthesize_tts_piper(text)
@@ -442,12 +533,8 @@ def _lev(a: str, b: str) -> int:
             prev = cur
     return dp[n]
 
-# Sensitivity → fuzzy tolerance (smaller = stricter)
-_SENS_FUZZ = {
-    "low": 1,
-    "medium": 2,
-    "high": 3,
-}
+_SENS_FUZZ = {"low": 1, "medium": 2, "high": 3}
+
 def _match_wake(text: str, wake: str, sensitivity: str, aliases: List[str] | None = None) -> bool:
     nt = _norm(text)
     nw = _norm(wake)
@@ -487,13 +574,7 @@ def _strip_wake(text: str, wake: str) -> str:
 # ---------------- Session ----------------
 def voice_session():
     """
-    Always-on state machine:
-      - If REQUIRE_WAKEWORD and WAKE_ALWAYS_ON:
-          * Continuously listen for utterances.
-          * When a wake is detected, open an ACCEPT window for WAKE_WINDOW_SEC.
-          * Commands in that window go to LLM; window extends on each command.
-      - If REQUIRE_WAKEWORD and not ALWAYS_ON: old behavior (single wake stage).
-      - If not REQUIRE_WAKEWORD: continuous conversation.
+    Always-on state machine with wake windows and continuous conversation modes.
     """
     global session_active, last_activity_ts
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -527,6 +608,18 @@ def voice_session():
         if alsa:
             alsa.stop()
 
+def _answer_and_speak(messages: List[Dict[str, str]], convo_log: List[str], on_done: Optional[Callable[[], None]] = None):
+    reply = _ollama_chat(messages)
+    print(f"[Bot] {reply}")
+    convo_log.append(f"Bot: {reply}")
+    messages.append({"role": "assistant", "content": reply})
+    speak(reply)
+    if on_done:
+        try:
+            on_done()
+        except Exception as e:
+            print(f"[post-tts] callback error: {e}", file=sys.stderr)
+
 def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
     global session_active
 
@@ -545,6 +638,13 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
         extend = WAKE_WINDOW_SEC if extend_sec is None else extend_sec
         accept_until = max(accept_until, now + extend)
 
+    def post_tts_hold():
+        # keep accept window open a bit longer after bot finishes talking
+        if REQUIRE_WAKEWORD and WAKE_ALWAYS_ON:
+            now = time.time()
+            maybe_extend_window(now, POST_TTS_ACCEPT_SEC)
+            print(f"[Wake] extended {POST_TTS_ACCEPT_SEC}s after TTS")
+
     # --- Legacy single-shot wake mode ---
     if REQUIRE_WAKEWORD and not WAKE_ALWAYS_ON:
         print(f"[Wakeword] Say: '{WAKEWORD}'")
@@ -555,7 +655,7 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                 session_active = False
                 return
 
-            pcm = record_until_silence(min_ms=700, pad_ms=200)
+            pcm = record_until_silence(min_ms=500, pad_ms=150)
             if not session_active or not pcm:
                 continue
 
@@ -579,11 +679,7 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                     print(f"[User] {cleaned}")
                     convo_log.append(f"User: {cleaned}")
                     messages.append({"role": "user", "content": cleaned})
-                    reply = _ollama_chat(messages)
-                    print(f"[Bot] {reply}")
-                    convo_log.append(f"Bot: {reply}")
-                    messages.append({"role": "assistant", "content": reply})
-                    speak(reply)
+                    _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
                 break
 
     # --- Always-on or normal conversation loop ---
@@ -608,7 +704,6 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
 
         # If wakeword is required, decide whether this utterance should trigger or be treated as a command
         if REQUIRE_WAKEWORD:
-            # Always-on: continuously look for wake; otherwise, in legacy mode we've already passed wake stage
             if WAKE_ALWAYS_ON:
                 if not accepting:
                     # Look for a wake in this utterance
@@ -621,11 +716,7 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                             print(f"[User] {cleaned}")
                             convo_log.append(f"User: {cleaned}")
                             messages.append({"role": "user", "content": cleaned})
-                            reply = _ollama_chat(messages)
-                            print(f"[Bot] {reply}")
-                            convo_log.append(f"Bot: {reply}")
-                            messages.append({"role": "assistant", "content": reply})
-                            speak(reply)
+                            _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
                             maybe_extend_window(now)  # keep window open for follow-up
                         continue  # go back to listening (window is open)
                     else:
@@ -637,7 +728,6 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                     if now > accept_until:
                         accepting = False
                         print("[Wake] window expired → waiting for wake")
-                        # Fall through to next loop
                         continue
                     # Treat the utterance as a command (strip wake if user repeats it)
                     cleaned = _strip_wake(text, WAKEWORD)
@@ -645,24 +735,16 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                     print(f"[User] {user_text}")
                     convo_log.append(f"User: {user_text}")
                     messages.append({"role": "user", "content": user_text})
-                    reply = _ollama_chat(messages)
-                    print(f"[Bot] {reply}")
-                    convo_log.append(f"Bot: {reply}")
-                    messages.append({"role": "assistant", "content": reply})
-                    speak(reply)
+                    _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
                     maybe_extend_window(now)  # extend the window with each command
                     continue
-            # else: legacy single-shot path already handled; just converse below
+            # else: legacy single-shot path already handled above
 
-        # If wakeword not required, or in legacy mode after initial wake:
+        # If wakeword not required, or legacy mode after initial wake:
         print(f"[User] {text}")
         convo_log.append(f"User: {text}")
         messages.append({"role": "user", "content": text})
-        reply = _ollama_chat(messages)
-        print(f"[Bot] {reply}")
-        convo_log.append(f"Bot: {reply}")
-        messages.append({"role": "assistant", "content": reply})
-        speak(reply)
+        _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
 
 # ---------------- MQTT ----------------
 def on_connect(client, userdata, flags, reason_code, properties):

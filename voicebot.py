@@ -121,6 +121,15 @@ vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 # ---- Output sanitization: remove chain-of-thought / <think> blocks ----
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
+
+def _drain_queue(q: "queue.Queue[bytes]") -> None:
+    """Remove any buffered frames so new sessions start cleanly."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
 def clean_response(text: str) -> str:
     if not text:
         return ""
@@ -587,6 +596,7 @@ def voice_session():
         if USE_ALSA_CAPTURE:
             alsa = ALSACapture(ALSA_DEVICE, SAMPLE_RATE)
             alsa.start()
+            _drain_queue(audio_q)
             _run_dialog(messages, convo_log)
         else:
             # Optional PortAudio fallback
@@ -595,6 +605,7 @@ def voice_session():
                 if status:
                     print(f"[sounddevice] {status}", file=sys.stderr)
                 audio_q.put((indata[:, 0] * 32767).astype(np.int16).tobytes())
+            _drain_queue(audio_q)
             with sd.InputStream(device=INPUT_DEVICE_INDEX, channels=1, samplerate=SAMPLE_RATE,
                                 dtype="float32", callback=cb):
                 _run_dialog(messages, convo_log)
@@ -686,18 +697,41 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
     idle_tries = 0
     while session_active:
         pcm = record_until_silence()
+
+        if not session_active:
+            break
+
         if not pcm:
             idle_tries += 1
             if idle_tries >= 3:
                 idle_tries = 0
                 print("[Debug] capturing fixed 3s window…")
                 pcm = fixed_capture_3s()
-        if not session_active or not pcm:
-            break
+                if not pcm:
+                    continue
+            else:
+                continue
+
+        idle_tries = 0
 
         text = transcribe(pcm)
         if not text:
-            print("[ASR] empty transcript")
+            if pcm:
+                arr = np.frombuffer(pcm, dtype=np.int16)
+                rms = float(np.sqrt(np.mean((arr.astype(np.float32) / 32768.0) ** 2))) if arr.size else 0.0
+                peak = int(np.max(np.abs(arr))) if arr.size else 0
+                print(f"[ASR] empty transcript (samples={arr.size}, rms={rms:.6f}, peak={peak})")
+                if WAKE_DEBUG_WAV and arr.size:
+                    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                    debug_path = f"/tmp/asr_empty_{ts}.wav"
+                    with wave.open(debug_path, "wb") as w:
+                        w.setnchannels(1)
+                        w.setsampwidth(2)
+                        w.setframerate(SAMPLE_RATE)
+                        w.writeframes(pcm)
+                    print(f"[ASRDebug] wrote {debug_path}")
+            else:
+                print("[ASR] empty transcript (no audio frames)")
             continue
 
         now = time.time()
@@ -792,14 +826,31 @@ def main():
             print(f"[MQTT] Connect failed: {e}")
             run_locally = True
 
-    if run_locally:
-        global session_active
-        session_active = True
-        voice_session()
-
     try:
-        while not run_locally:
-            time.sleep(0.5)
+        if run_locally:
+            restart_delay = 1.0
+            while True:
+                global session_active
+                session_active = True
+                started = time.time()
+                try:
+                    voice_session()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    print(f"[Voicebot] Session error: {e}", file=sys.stderr)
+                if not run_locally:
+                    break
+                ran_for = time.time() - started
+                if ran_for > 30:
+                    restart_delay = 1.0
+                else:
+                    restart_delay = min(restart_delay * 2, 10.0)
+                print(f"[Voicebot] Session ended; restarting in {restart_delay:.1f}s")
+                time.sleep(restart_delay)
+        else:
+            while True:
+                time.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:

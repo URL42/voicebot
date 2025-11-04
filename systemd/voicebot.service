@@ -1,0 +1,20 @@
+[Unit]
+Description=TARS Voicebot
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=anthony
+Group=anthony
+WorkingDirectory=/home/anthony/voicebot
+EnvironmentFile=/etc/voicebot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env uv run python /home/anthony/voicebot/voicebot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

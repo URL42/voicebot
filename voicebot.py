@@ -13,6 +13,9 @@ Voicebot with:
 - Keeps wake accept window open briefly **after TTS** for natural follow-ups
 """
 
+import argparse
+import logging
+import math
 import os
 import re
 import sys
@@ -24,7 +27,10 @@ import threading
 import subprocess
 import datetime
 import tempfile
-from typing import List, Dict, Optional, Callable
+import shutil
+from collections import deque
+from pathlib import Path
+from typing import List, Dict, Optional, Callable, Tuple
 
 import numpy as np
 import webrtcvad
@@ -33,9 +39,23 @@ from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 import paho.mqtt.client as mqtt
 
+try:
+    from openwakeword.model import Model as WakewordModel
+except ImportError:  # pragma: no cover - optional dependency
+    WakewordModel = None
+
+try:
+    from rapidfuzz import fuzz as rapidfuzz_fuzz
+    from rapidfuzz.distance import Levenshtein as rapidfuzz_lev
+except ImportError:  # pragma: no cover - optional dependency
+    rapidfuzz_fuzz = None
+    rapidfuzz_lev = None
+
 # ---------------- Config ----------------
 load_dotenv()
 
+LOG_LEVEL            = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_JSON             = os.getenv("LOG_JSON", "1") == "1"
 ENABLE_PRESENCE       = os.getenv("ENABLE_PRESENCE", "1") == "1"
 MQTT_HOST             = os.getenv("MQTT_HOST", "127.0.0.1")
 MQTT_PORT             = int(os.getenv("MQTT_PORT", "1883"))
@@ -47,9 +67,12 @@ INPUT_DEVICE_INDEX    = int(os.getenv("INPUT_DEVICE_INDEX", "-1"))  # PortAudio 
 VAD_AGGRESSIVENESS    = int(os.getenv("VAD_AGGRESSIVENESS", "2"))
 MAX_SILENCE_SECONDS   = float(os.getenv("MAX_SILENCE_SECONDS", "0.7"))
 SESSION_IDLE_TIMEOUT  = float(os.getenv("SESSION_IDLE_TIMEOUT", "45"))
+MAX_HISTORY_TURNS     = int(os.getenv("MAX_HISTORY_TURNS", "12"))  # user+assistant pairs kept in prompt
 SAMPLE_RATE           = 16000
 FRAME_MS              = 30
 FRAME_BYTES           = int(SAMPLE_RATE * (FRAME_MS / 1000.0) * 2)  # 16-bit mono
+PRE_SPEECH_PAD_MS     = int(os.getenv("PRE_SPEECH_PAD_MS", "120"))
+PRE_SPEECH_FRAMES     = max(0, int(round(PRE_SPEECH_PAD_MS / FRAME_MS))) if PRE_SPEECH_PAD_MS > 0 else 0
 
 USE_ALSA_CAPTURE      = os.getenv("USE_ALSA_CAPTURE", "1") == "1"
 ALSA_DEVICE           = os.getenv("ALSA_DEVICE", "").strip()        # e.g. "plughw:2,0" or "auto"
@@ -62,8 +85,14 @@ WAKE_SENSITIVITY      = os.getenv("WAKE_SENSITIVITY", "medium").strip().lower() 
 WAKE_WINDOW_SEC       = float(os.getenv("WAKE_WINDOW_SEC", "10"))
 POST_TTS_ACCEPT_SEC   = float(os.getenv("POST_TTS_ACCEPT_SEC", "4"))  # keep window open after TTS
 WAKEWORD              = os.getenv("WAKEWORD", "hey tars").strip()
+WAKE_ALIASES          = [a.strip() for a in os.getenv("WAKE_ALIASES", "hey tars,tars").split(",") if a.strip()]
 WAKEWORD_TIMEOUT      = float(os.getenv("WAKEWORD_TIMEOUT", "45"))
 WAKE_DEBUG_WAV        = os.getenv("WAKE_DEBUG_WAV", "0") == "1"  # <-- fixed
+WAKE_RATIO_THRESHOLD  = int(os.getenv("WAKE_RATIO_THRESHOLD", "80"))
+WAKE_NEAR_MISS_DELTA  = int(os.getenv("WAKE_NEAR_MISS_DELTA", "5"))
+USE_ACOUSTIC_WAKE     = os.getenv("USE_ACOUSTIC_WAKE", "0") == "1"
+ACOUSTIC_WAKE_MODEL   = os.getenv("ACOUSTIC_WAKE_MODEL", "").strip()
+ACOUSTIC_WAKE_THRESHOLD = float(os.getenv("ACOUSTIC_WAKE_THRESHOLD", "0.65"))
 
 # Ollama / LLM
 OLLAMA_BASE_URL       = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -113,10 +142,28 @@ PIPER_NOISE_SCALE     = os.getenv("PIPER_NOISE_SCALE", "0.667")
 PIPER_NOISE_W         = os.getenv("PIPER_NOISE_W", "0.8")
 
 # ---------------- State ----------------
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(message)s")
+logger = logging.getLogger("voicebot")
+
+
+def log_event(event: str, **fields) -> None:
+    payload = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "event": event,
+    }
+    payload.update(fields)
+    if LOG_JSON:
+        logger.info(json.dumps(payload, ensure_ascii=False))
+    else:
+        meta = ", ".join(f"{k}={v}" for k, v in payload.items() if k != "event")
+        logger.info("%s | %s", event, meta)
+
+
 session_active: bool = False
 last_activity_ts: float = 0.0
 audio_q: "queue.Queue[bytes]" = queue.Queue()
 vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+acoustic_wake = None  # initialized after class definitions
 
 # ---- Output sanitization: remove chain-of-thought / <think> blocks ----
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -138,6 +185,48 @@ def clean_response(text: str) -> str:
     lines = [ln for ln in text.splitlines() if not ln.strip().lower().startswith(("thought", "reason", "analysis"))]
     text = "\n".join(lines).strip()
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _pcm_stats(pcm: bytes) -> Dict[str, float]:
+    if not pcm:
+        return {"samples": 0, "rms": 0.0, "peak": 0, "sec": 0.0}
+    arr = np.frombuffer(pcm, dtype=np.int16)
+    if arr.size == 0:
+        return {"samples": 0, "rms": 0.0, "peak": 0, "sec": 0.0}
+    float_arr = arr.astype(np.float32) / 32768.0
+    rms = float(np.sqrt(np.mean(float_arr ** 2)))
+    peak = int(np.max(np.abs(arr)))
+    sec = float(len(pcm) / (2 * SAMPLE_RATE))
+    return {"samples": int(arr.size), "rms": rms, "peak": peak, "sec": sec}
+
+
+def _dump_wav(prefix: str, pcm: bytes) -> Optional[str]:
+    if not pcm:
+        return None
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = f"/tmp/{prefix}_{ts}.wav"
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(pcm)
+    log_event("debug_wav_dump", path=path, prefix=prefix, **_pcm_stats(pcm))
+    return path
+
+
+def _maybe_dump_near_miss(tag: str, pcm: bytes, ratio: int, threshold: int) -> None:
+    if not WAKE_DEBUG_WAV or not pcm or threshold <= 0:
+        return
+    if ratio >= max(0, threshold - WAKE_NEAR_MISS_DELTA):
+        _dump_wav(tag, pcm)
+
+
+def _resolve_exec(binary: str) -> Optional[str]:
+    if not binary:
+        return None
+    if os.path.isabs(binary):
+        return binary if os.path.exists(binary) else None
+    return shutil.which(binary)
 
 print("Loading Whisper model...")
 whisper_model = WhisperModel(WHISPER_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
@@ -360,6 +449,53 @@ class ALSACapture:
             except Exception:
                 pass
 
+
+class AcousticWakeDetector:
+    def __init__(self, model_path: str, threshold: float):
+        self.enabled = False
+        self.threshold = threshold
+        self.model_path = model_path
+        self._model = None
+        if not USE_ACOUSTIC_WAKE:
+            return
+        if not model_path:
+            print("[Wakeword] USE_ACOUSTIC_WAKE=1 but no ACOUSTIC_WAKE_MODEL provided", file=sys.stderr)
+            return
+        if not Path(model_path).exists():
+            print(f"[Wakeword] Model not found at {model_path}", file=sys.stderr)
+            return
+        if WakewordModel is None:
+            print("[Wakeword] openwakeword not installed; run `uv add openwakeword`", file=sys.stderr)
+            return
+        try:
+            self._model = WakewordModel(wakeword_models=[model_path])
+            self.enabled = True
+            log_event("wake_acoustic_ready", model=os.path.basename(model_path), threshold=threshold)
+        except Exception as exc:
+            print(f"[Wakeword] Failed to load acoustic model: {exc}", file=sys.stderr)
+
+    def detect(self, pcm: bytes) -> Tuple[bool, float]:
+        if not self.enabled or not pcm:
+            return False, 0.0
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        try:
+            result = self._model.predict(audio)
+        except Exception as exc:
+            log_event("wake_acoustic_error", error=str(exc))
+            return False, 0.0
+        score = 0.0
+        if isinstance(result, dict):
+            score = float(max(result.values()) if result else 0.0)
+        elif isinstance(result, (list, tuple, np.ndarray)) and len(result):
+            score = float(np.max(result))
+        triggered = score >= self.threshold
+        log_event("wake_acoustic_score", score=score, triggered=triggered)
+        return triggered, score
+
+
+# Instantiate after class definition so Python has the symbol
+acoustic_wake = AcousticWakeDetector(ACOUSTIC_WAKE_MODEL, ACOUSTIC_WAKE_THRESHOLD)
+
 # ---------------- Audio Logic ----------------
 def record_until_silence(min_ms: int = 0, pad_ms: int = 0) -> bytes:
     """
@@ -374,6 +510,9 @@ def record_until_silence(min_ms: int = 0, pad_ms: int = 0) -> bytes:
     pad_frames = max(0, int(pad_ms // FRAME_MS))
     voiced_frames = 0
     trailing_frames = 0
+    pad_buffer = bytearray()
+    max_pad_bytes = pad_frames * FRAME_BYTES
+    pre_buffer = deque(maxlen=PRE_SPEECH_FRAMES) if PRE_SPEECH_FRAMES else None
     pulls = 0
 
     while session_active:
@@ -393,45 +532,61 @@ def record_until_silence(min_ms: int = 0, pad_ms: int = 0) -> bytes:
                 break
 
             if vad.is_speech(frame, SAMPLE_RATE):
+                if pre_buffer:
+                    while pre_buffer:
+                        voiced.extend(pre_buffer.popleft())
                 voiced.extend(frame)
                 voiced_frames += 1
                 trailing_frames = 0
                 silence_start = None
+                if pad_buffer:
+                    pad_buffer.clear()
                 last_activity_ts = time.time()
             else:
                 if voiced:
                     trailing_frames += 1
+                    if max_pad_bytes and len(pad_buffer) < max_pad_bytes:
+                        pad_buffer.extend(frame)
                     enough_audio = (voiced_frames >= min_frames)
                     if enough_audio and trailing_frames >= pad_frames:
                         if silence_start is None:
                             silence_start = time.time()
                         elif time.time() - silence_start >= MAX_SILENCE_SECONDS:
-                            return bytes(voiced)
+                            return bytes(voiced + pad_buffer)
+                elif pre_buffer is not None:
+                    pre_buffer.append(frame)
 
         if time.time() - last_activity_ts > SESSION_IDLE_TIMEOUT:
             break
 
     if not voiced_frames:
         print("[VAD] no voiced audio captured.")
-    return bytes(voiced)
+    return bytes(voiced + pad_buffer)
 
-def fixed_capture_3s() -> bytes:
-    """Fallback capture: 3s raw grab regardless of VAD (for debugging)."""
+def capture_fixed(duration_sec: float = 3.0) -> bytes:
+    """Raw grab via arecord for debugging/calibration."""
     dev = resolve_alsa_device_for_capture(ALSA_DEVICE or "auto")
-    cmd = ["arecord", "-q", "-f", "S16_LE", "-c", "1", "-r", str(SAMPLE_RATE), "-d", "3", "-"]
+    seconds = max(1, int(round(duration_sec)))
+    cmd = ["arecord", "-q", "-f", "S16_LE", "-c", "1", "-r", str(SAMPLE_RATE), "-d", str(seconds), "-"]
     if dev:
         cmd[1:1] = ["-D", dev]
     try:
         data = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        log_event("capture_fixed", seconds=seconds, **_pcm_stats(data))
         return data
     except subprocess.CalledProcessError as e:
-        print(f"[Debug] fixed_capture_3s error: {e.output}", file=sys.stderr)
+        print(f"[Debug] capture_fixed error: {e.output}", file=sys.stderr)
         return b""
+
+
+def fixed_capture_3s() -> bytes:
+    return capture_fixed(3)
 
 def transcribe(pcm16: bytes) -> str:
     if not pcm16:
         return ""
     audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+    started = time.time()
     segments, _ = whisper_model.transcribe(
         audio,
         vad_filter=False,                 # we already gate with WebRTC VAD
@@ -440,17 +595,25 @@ def transcribe(pcm16: bytes) -> str:
         condition_on_previous_text=False, # don't spend time linking segments
         without_timestamps=True,
     )
-    return "".join(seg.text for seg in segments).strip()
+    text = "".join(seg.text for seg in segments).strip()
+    log_event("asr_transcript", latency_ms=int((time.time() - started) * 1000), text=text, **_pcm_stats(pcm16))
+    return text
 
 # ---------------- TTS (Piper) ----------------
 def synthesize_tts_piper(text: str) -> Optional[str]:
     if not PIPER_VOICE:
         print("[TTS] PIPER_VOICE not set; skipping TTS.", file=sys.stderr)
         return None
+    piper_exec = _resolve_exec(PIPER_BINARY)
+    if not piper_exec:
+        msg = f"Piper binary '{PIPER_BINARY}' not found in PATH"
+        print(f"[TTS] {msg}", file=sys.stderr)
+        log_event("tts_error", error=msg)
+        return None
     fd, out_path = tempfile.mkstemp(prefix="voicebot_tts_", suffix=".wav")
     os.close(fd)
     cmd = [
-        PIPER_BINARY,
+        piper_exec,
         "--model", PIPER_VOICE,
         "--length_scale", str(PIPER_LENGTH_SCALE),
         "--noise_scale", str(PIPER_NOISE_SCALE),
@@ -464,7 +627,9 @@ def synthesize_tts_piper(text: str) -> Optional[str]:
         if p.returncode != 0:
             print(f"[TTS] Piper failed: {stderr}", file=sys.stderr)
             os.unlink(out_path)
+            log_event("tts_error", error=stderr.strip(), code=p.returncode)
             return None
+        log_event("tts_synth", path=out_path, chars=len(text))
         return out_path
     except Exception as e:
         print(f"[TTS] Piper error: {e}", file=sys.stderr)
@@ -472,6 +637,7 @@ def synthesize_tts_piper(text: str) -> Optional[str]:
             os.unlink(out_path)
         except Exception:
             pass
+        log_event("tts_error", error=str(e))
         return None
 
 def play_wav(path: str):
@@ -480,6 +646,7 @@ def play_wav(path: str):
     if dev:
         cmd[1:1] = ["-D", dev]
     print("🔊 Playing:", " ".join(cmd))
+    log_event("tts_play", device=dev or "default", path=path)
 
     proc = subprocess.Popen(cmd)
     if not ALLOW_BARGE_IN:
@@ -527,10 +694,42 @@ def speak(text: str):
         print("[TTS] (spoken reply skipped) " + text)
 
 # ---------------- Wakeword Matching ----------------
+_WAKE_FILLERS = ("hey", "hi", "uh", "um", "ok", "okay", "yo", "hello", "alright")
+_SENS_RATIO_DELTA = {"low": -5, "medium": 0, "high": 5}  # positive → stricter, negative → looser
+
+
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9 ]+", " ", s.lower()).strip()
 
+
+def _wake_variants(overrides: Optional[List[str]] = None) -> List[str]:
+    """
+    Return the set of phrases that should count as a wakeword.
+    Includes the configured WAKEWORD, env-provided aliases, and the final token.
+    """
+    base_list = overrides if overrides is not None else WAKE_ALIASES
+    candidates = [WAKEWORD] + (base_list or [])
+    seen = set()
+    variants: List[str] = []
+    for cand in candidates:
+        word = cand.strip()
+        if not word:
+            continue
+        key = word.lower()
+        if key in seen:
+            continue
+        variants.append(word)
+        seen.add(key)
+    if WAKEWORD:
+        last = WAKEWORD.split()[-1]
+        if last and last.lower() not in seen:
+            variants.append(last)
+    return variants
+
+
 def _lev(a: str, b: str) -> int:
+    if rapidfuzz_lev:
+        return int(rapidfuzz_lev.distance(a, b))
     m, n = len(a), len(b)
     dp = list(range(n + 1))
     for i, ca in enumerate(a, 1):
@@ -542,43 +741,77 @@ def _lev(a: str, b: str) -> int:
             prev = cur
     return dp[n]
 
-_SENS_FUZZ = {"low": 1, "medium": 2, "high": 3}
 
-def _match_wake(text: str, wake: str, sensitivity: str, aliases: List[str] | None = None) -> bool:
-    nt = _norm(text)
+def _ratio(a: str, b: str) -> int:
+    if rapidfuzz_fuzz:
+        return int(rapidfuzz_fuzz.partial_ratio(a, b))
+    if not a and not b:
+        return 100
+    dist = _lev(a, b)
+    denom = max(len(a), len(b), 1)
+    return max(0, int((1 - (dist / denom)) * 100))
+
+
+def _strip_fillers(text: str) -> str:
+    tokens = text.split()
+    while tokens and tokens[0] in _WAKE_FILLERS:
+        tokens.pop(0)
+    return " ".join(tokens)
+
+
+def _match_wake(text: str, wake: str, sensitivity: str, aliases: List[str] | None = None) -> Tuple[bool, int, int]:
+    nt = _strip_fillers(_norm(text))
     nw = _norm(wake)
-    fuzz = _SENS_FUZZ.get(sensitivity, 2)
-    cands = [nw] + ([_norm(a) for a in (aliases or [])])
+    alias_src = aliases if aliases is not None else _wake_variants()
+    cands = [nw] + ([_norm(a) for a in alias_src])
 
-    # Exact/substring match first
+    best_ratio = 0
     for w in cands:
-        if w and w in nt:
-            return True
-
-    # Allow last token alone for medium/high only
-    last = nw.split()[-1] if nw else ""
-    if sensitivity != "low" and last and last in nt:
-        return True
-
-    # Fuzzy edit-distance match
-    for w in cands + ([last] if last else []):
         if not w:
             continue
-        if _lev(nt, w) <= fuzz:
-            return True
+        if w in nt:
+            log_event("wake_transcript_match", method="substring", candidate=w)
+            return True, 100, 0
+        ratio = _ratio(nt, w)
+        best_ratio = max(best_ratio, ratio)
 
-    return False
+    last = nw.split()[-1] if nw else ""
+    if sensitivity != "low" and last and last in nt:
+        log_event("wake_transcript_match", method="last_token", candidate=last)
+        return True, 90, 0
+
+    threshold = max(50, WAKE_RATIO_THRESHOLD + _SENS_RATIO_DELTA.get(sensitivity, 0))
+    if last:
+        best_ratio = max(best_ratio, _ratio(nt, last))
+    matched = best_ratio >= threshold
+    log_event("wake_transcript_ratio", ratio=best_ratio, threshold=threshold, matched=matched)
+    return matched, best_ratio, threshold
+
 
 def _strip_wake(text: str, wake: str) -> str:
     t = text.strip()
-    lw = _norm(wake)
-    nt = _norm(t)
-    if nt.startswith(lw):
-        return t[len(wake):].lstrip(",. :;!?").strip()
-    last = lw.split()[-1] if lw else ""
-    if last and nt.startswith(last):
-        return t[len(last):].lstrip(",. :;!?").strip()
+    variants = _wake_variants()
+    if wake and wake not in variants:
+        variants.append(wake)
+    for variant in variants:
+        if not variant:
+            continue
+        pattern = re.compile(rf"^\s*{re.escape(variant)}[\s,.:;!?-]*", re.IGNORECASE)
+        stripped = re.sub(pattern, "", t, count=1).strip()
+        if stripped != t:
+            return stripped
     return t
+
+def _prune_history(msgs: List[Dict[str, str]]) -> None:
+    """
+    Keep the prompt bounded so Ollama does not reprocess unlimited turns.
+    """
+    if MAX_HISTORY_TURNS <= 0:
+        return
+    max_messages = MAX_HISTORY_TURNS * 2  # user+assistant pairs (system prompt excluded)
+    excess = len(msgs) - 1 - max_messages
+    if excess > 0:
+        del msgs[1:1 + excess]
 
 # ---------------- Session ----------------
 def voice_session():
@@ -624,6 +857,7 @@ def _answer_and_speak(messages: List[Dict[str, str]], convo_log: List[str], on_d
     print(f"[Bot] {reply}")
     convo_log.append(f"Bot: {reply}")
     messages.append({"role": "assistant", "content": reply})
+    _prune_history(messages)
     speak(reply)
     if on_done:
         try:
@@ -678,20 +912,34 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                     w.writeframes(pcm)
                 print(f"[WakeDebug] wrote {p}")
 
+            acoustic_triggered = False
+            acoustic_score = 0.0
+            if acoustic_wake.enabled:
+                acoustic_triggered, acoustic_score = acoustic_wake.detect(pcm)
+                if acoustic_triggered:
+                    log_event("wake_detected", method="acoustic", score=acoustic_score)
+
             text = transcribe(pcm)
             if not text:
                 continue
 
             print(f"[Wakeword->ASR] {text}")
-            if _match_wake(text, WAKEWORD, WAKE_SENSITIVITY,
-                           aliases=["hey tars", "tars", "hey, tars", "hey-tars"]):
+            matched, ratio, threshold = _match_wake(
+                text,
+                WAKEWORD,
+                WAKE_SENSITIVITY,
+            )
+            if matched or acoustic_triggered:
                 cleaned = _strip_wake(text, WAKEWORD)
                 if cleaned:
                     print(f"[User] {cleaned}")
                     convo_log.append(f"User: {cleaned}")
                     messages.append({"role": "user", "content": cleaned})
+                    _prune_history(messages)
                     _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
                 break
+            else:
+                _maybe_dump_near_miss("wake_near", pcm, ratio, threshold)
 
     # --- Always-on or normal conversation loop ---
     idle_tries = 0
@@ -714,48 +962,56 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
 
         idle_tries = 0
 
+        now = time.time()
+        acoustic_triggered = False
+        acoustic_score = 0.0
+        if REQUIRE_WAKEWORD and WAKE_ALWAYS_ON and not accepting and acoustic_wake.enabled:
+            acoustic_triggered, acoustic_score = acoustic_wake.detect(pcm)
+
         text = transcribe(pcm)
         if not text:
-            if pcm:
-                arr = np.frombuffer(pcm, dtype=np.int16)
-                rms = float(np.sqrt(np.mean((arr.astype(np.float32) / 32768.0) ** 2))) if arr.size else 0.0
-                peak = int(np.max(np.abs(arr))) if arr.size else 0
-                print(f"[ASR] empty transcript (samples={arr.size}, rms={rms:.6f}, peak={peak})")
-                if WAKE_DEBUG_WAV and arr.size:
-                    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                    debug_path = f"/tmp/asr_empty_{ts}.wav"
-                    with wave.open(debug_path, "wb") as w:
-                        w.setnchannels(1)
-                        w.setsampwidth(2)
-                        w.setframerate(SAMPLE_RATE)
-                        w.writeframes(pcm)
-                    print(f"[ASRDebug] wrote {debug_path}")
-            else:
-                print("[ASR] empty transcript (no audio frames)")
+            stats = _pcm_stats(pcm)
+            print(f"[ASR] empty transcript (samples={stats['samples']}, rms={stats['rms']:.6f}, peak={stats['peak']})")
+            log_event("asr_empty", **stats)
+            if WAKE_DEBUG_WAV and stats["samples"]:
+                _dump_wav("asr_empty", pcm)
+            if acoustic_triggered:
+                begin_accept_window(now)
+                log_event("wake_detected", method="acoustic", score=acoustic_score)
+                continue
             continue
-
-        now = time.time()
 
         # If wakeword is required, decide whether this utterance should trigger or be treated as a command
         if REQUIRE_WAKEWORD:
             if WAKE_ALWAYS_ON:
                 if not accepting:
                     # Look for a wake in this utterance
-                    if _match_wake(text, WAKEWORD, WAKE_SENSITIVITY,
-                                   aliases=["hey tars", "tars", "hey, tars", "hey-tars"]):
-                        begin_accept_window(now)
+                    matched, ratio, threshold = _match_wake(
+                        text,
+                        WAKEWORD,
+                        WAKE_SENSITIVITY,
+                    )
+                    if matched or acoustic_triggered:
+                        if acoustic_triggered:
+                            begin_accept_window(now)
+                            log_event("wake_detected", method="acoustic", score=acoustic_score)
+                        else:
+                            begin_accept_window(now)
+                            log_event("wake_detected", method="transcript", score=ratio)
                         cleaned = _strip_wake(text, WAKEWORD)
                         # If user said "hey tars, <command>" handle immediately
                         if cleaned:
                             print(f"[User] {cleaned}")
                             convo_log.append(f"User: {cleaned}")
                             messages.append({"role": "user", "content": cleaned})
+                            _prune_history(messages)
                             _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
                             maybe_extend_window(now)  # keep window open for follow-up
                         continue  # go back to listening (window is open)
                     else:
                         # Not a wake; ignore in wake-wait state
                         print(f"[WakeWait] heard non-wake utterance: {text}")
+                        _maybe_dump_near_miss("wake_near", pcm, ratio, threshold)
                         continue
                 else:
                     # We are within the accept window
@@ -767,8 +1023,10 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                     cleaned = _strip_wake(text, WAKEWORD)
                     user_text = cleaned if cleaned else text
                     print(f"[User] {user_text}")
+                    log_event("wake_command", text=user_text)
                     convo_log.append(f"User: {user_text}")
                     messages.append({"role": "user", "content": user_text})
+                    _prune_history(messages)
                     _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
                     maybe_extend_window(now)  # extend the window with each command
                     continue
@@ -778,7 +1036,53 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
         print(f"[User] {text}")
         convo_log.append(f"User: {text}")
         messages.append({"role": "user", "content": text})
+        _prune_history(messages)
         _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
+
+
+def _snr_db(speech_rms: float, noise_rms: float) -> float:
+    noise = max(noise_rms, 1e-6)
+    speech = max(speech_rms, 1e-6)
+    return 20.0 * math.log10(speech / noise)
+
+
+def calibrate_vad(noise_sec: int = 5, speech_sec: int = 4) -> None:
+    print(f"[Calibrate] Recording {noise_sec}s of background noise. Stay quiet…")
+    time.sleep(1)
+    noise = capture_fixed(noise_sec)
+    noise_stats = _pcm_stats(noise)
+
+    input("Press Enter, then speak your wakephrase for a few seconds…")
+    speech = capture_fixed(speech_sec)
+    speech_stats = _pcm_stats(speech)
+
+    snr = _snr_db(speech_stats["rms"], noise_stats["rms"])
+    if snr < 6:
+        suggested_vad = 3
+    elif snr < 12:
+        suggested_vad = 2
+    else:
+        suggested_vad = 1
+    max_silence = round(min(1.5, max(0.6, 1.2 - (snr / 40.0))), 2)
+    wake_window = round(max(4.0, min(15.0, (speech_stats["sec"] or 1.5) * 3)), 1)
+
+    print("\n[Calibrate] Results:")
+    print(f"  Noise RMS:   {noise_stats['rms']:.5f} (samples={noise_stats['samples']})")
+    print(f"  Speech RMS:  {speech_stats['rms']:.5f} (samples={speech_stats['samples']})")
+    print(f"  SNR (dB):    {snr:.1f}")
+    print("Suggested settings:")
+    print(f"  VAD_AGGRESSIVENESS={suggested_vad}")
+    print(f"  MAX_SILENCE_SECONDS={max_silence}")
+    print(f"  WAKE_WINDOW_SEC={wake_window}")
+    log_event(
+        "calibration",
+        noise_rms=noise_stats["rms"],
+        speech_rms=speech_stats["rms"],
+        snr_db=snr,
+        suggested_vad=suggested_vad,
+        suggested_max_silence=max_silence,
+        suggested_wake_window=wake_window,
+    )
 
 # ---------------- MQTT ----------------
 def on_connect(client, userdata, flags, reason_code, properties):
@@ -857,5 +1161,22 @@ def main():
         if mqtt_client:
             mqtt_client.loop_stop()
 
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="TARS Voicebot")
+    parser.add_argument("--calibrate-vad", action="store_true", help="run the calibration helper instead of the bot")
+    parser.add_argument("--noise-sec", type=int, default=5, help="seconds of background noise to sample")
+    parser.add_argument("--speech-sec", type=int, default=4, help="seconds to sample while speaking")
+    return parser.parse_args()
+
+
+def cli():
+    args = parse_args()
+    if args.calibrate_vad:
+        calibrate_vad(noise_sec=args.noise_sec, speech_sec=args.speech_sec)
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    cli()

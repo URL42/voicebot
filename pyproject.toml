@@ -13,4 +13,12 @@ dependencies = [
     "faster-whisper",
     "requests",
     "piper",
+    "rapidfuzz",
+    "openwakeword",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
 ]

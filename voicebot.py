@@ -830,6 +830,15 @@ def _strip_wake(text: str, wake: str) -> str:
             return stripped
     return t
 
+def _is_pure_wake(text: str, wake: str) -> bool:
+    if not text:
+        return False
+    cleaned = _strip_wake(text, wake)
+    if cleaned:
+        return False
+    matched, _, _ = _match_wake(text, wake, WAKE_SENSITIVITY)
+    return matched
+
 def _prune_history(msgs: List[Dict[str, str]]) -> None:
     """
     Keep the prompt bounded so Ollama does not reprocess unlimited turns.
@@ -1020,21 +1029,20 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                         WAKE_SENSITIVITY,
                     )
                     if matched or acoustic_triggered:
-                        if acoustic_triggered:
-                            begin_accept_window(now)
-                            log_event("wake_detected", method="acoustic", score=acoustic_score)
-                        else:
-                            begin_accept_window(now)
-                            log_event("wake_detected", method="transcript", score=ratio)
+                        begin_accept_window(now)
+                        log_event("wake_detected", method="acoustic" if acoustic_triggered else "transcript", score=acoustic_score if acoustic_triggered else ratio)
                         cleaned = _strip_wake(text, WAKEWORD)
+                        if not cleaned:
+                            print("[Wake] phrase detected again; waiting for command…")
+                            log_event("wake_repeat", text=text)
+                            continue
                         # If user said "hey tars, <command>" handle immediately
-                        if cleaned:
-                            print(f"[User] {cleaned}")
-                            convo_log.append(f"User: {cleaned}")
-                            messages.append({"role": "user", "content": cleaned})
-                            _prune_history(messages)
-                            _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
-                            maybe_extend_window(now)  # keep window open for follow-up
+                        print(f"[User] {cleaned}")
+                        convo_log.append(f"User: {cleaned}")
+                        messages.append({"role": "user", "content": cleaned})
+                        _prune_history(messages)
+                        _answer_and_speak(messages, convo_log, on_done=post_tts_hold)
+                        maybe_extend_window(now)  # keep window open for follow-up
                         continue  # go back to listening (window is open)
                     else:
                         # Not a wake; ignore in wake-wait state
@@ -1049,6 +1057,10 @@ def _run_dialog(messages: List[Dict[str, str]], convo_log: List[str]):
                         continue
                     # Treat the utterance as a command (strip wake if user repeats it)
                     cleaned = _strip_wake(text, WAKEWORD)
+                    if not cleaned and _is_pure_wake(text, WAKEWORD):
+                        print("[Wake] ignoring duplicate wake; still listening…")
+                        log_event("wake_repeat", text=text)
+                        continue
                     user_text = cleaned if cleaned else text
                     print(f"[User] {user_text}")
                     log_event("wake_command", text=user_text)

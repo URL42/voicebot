@@ -78,7 +78,9 @@ The detector runs before Whisper and opens the accept window when the score pass
 - Set `WAKE_DEBUG_WAV=1` to dump both legacy wakeword attempts and near-miss clips from always-on mode. Files land in `/tmp/wake_*.wav` with the transcript score metadata.
 - Run `make calibrate` (or `uv run python voicebot.py --calibrate-vad`) to capture a few seconds of room noise + a spoken wakephrase. The tool prints RMS/SNR plus suggested `VAD_AGGRESSIVENESS`, `MAX_SILENCE_SECONDS`, and `WAKE_WINDOW_SEC` values.
 - If you swap to a new phrase (e.g., “hey Jarvis”), mirror those variants in `WAKE_ALIASES` so they’re stripped before we forward the text to the LLM.
-- `PRE_SPEECH_PAD_MS` buffers ~120 ms of audio ahead of VAD detection, which keeps the first syllable of your command from getting clipped.
+- `PRE_SPEECH_BUFFER_MS` maintains ~400 ms of rolling audio before VAD fires so your wake/command isn’t clipped; 300–500 ms feels best.
+- Shorter `FRAME_MS` (10–20 ms) lowers VAD latency and makes the wake detector more responsive than the old 30 ms default.
+- `INITIAL_TTS_SILENCE_MS` injects ~80 ms of silence ahead of every Piper playback so the amplifier unmutes before speech starts.
 
 ### Standalone TTS Tester
 Need to sanity-check Piper without running the whole assistant?

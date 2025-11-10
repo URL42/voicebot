@@ -69,10 +69,10 @@ MAX_SILENCE_SECONDS   = float(os.getenv("MAX_SILENCE_SECONDS", "0.7"))
 SESSION_IDLE_TIMEOUT  = float(os.getenv("SESSION_IDLE_TIMEOUT", "45"))
 MAX_HISTORY_TURNS     = int(os.getenv("MAX_HISTORY_TURNS", "12"))  # user+assistant pairs kept in prompt
 SAMPLE_RATE           = 16000
-FRAME_MS              = 30
+FRAME_MS              = int(os.getenv("FRAME_MS", "20"))
 FRAME_BYTES           = int(SAMPLE_RATE * (FRAME_MS / 1000.0) * 2)  # 16-bit mono
-PRE_SPEECH_PAD_MS     = int(os.getenv("PRE_SPEECH_PAD_MS", "120"))
-PRE_SPEECH_FRAMES     = max(0, int(round(PRE_SPEECH_PAD_MS / FRAME_MS))) if PRE_SPEECH_PAD_MS > 0 else 0
+PRE_SPEECH_BUFFER_MS  = int(os.getenv("PRE_SPEECH_BUFFER_MS", "400"))  # rolling buffer size
+PRE_SPEECH_FRAMES     = max(0, int(round(PRE_SPEECH_BUFFER_MS / FRAME_MS)))
 
 USE_ALSA_CAPTURE      = os.getenv("USE_ALSA_CAPTURE", "1") == "1"
 ALSA_DEVICE           = os.getenv("ALSA_DEVICE", "").strip()        # e.g. "plughw:2,0" or "auto"
@@ -140,6 +140,7 @@ PIPER_VOICE           = os.getenv("PIPER_VOICE", "").strip()  # e.g., /home/anth
 PIPER_LENGTH_SCALE    = os.getenv("PIPER_LENGTH_SCALE", "0.9")
 PIPER_NOISE_SCALE     = os.getenv("PIPER_NOISE_SCALE", "0.667")
 PIPER_NOISE_W         = os.getenv("PIPER_NOISE_W", "0.8")
+INITIAL_TTS_SILENCE_MS = int(os.getenv("INITIAL_TTS_SILENCE_MS", "80"))
 
 # ---------------- State ----------------
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(message)s")
@@ -513,6 +514,7 @@ def record_until_silence(min_ms: int = 0, pad_ms: int = 0) -> bytes:
     pad_buffer = bytearray()
     max_pad_bytes = pad_frames * FRAME_BYTES
     pre_buffer = deque(maxlen=PRE_SPEECH_FRAMES) if PRE_SPEECH_FRAMES else None
+    in_speech = False
     pulls = 0
 
     while session_active:
@@ -532,9 +534,10 @@ def record_until_silence(min_ms: int = 0, pad_ms: int = 0) -> bytes:
                 break
 
             if vad.is_speech(frame, SAMPLE_RATE):
-                if pre_buffer:
+                if not in_speech and pre_buffer:
                     while pre_buffer:
                         voiced.extend(pre_buffer.popleft())
+                in_speech = True
                 voiced.extend(frame)
                 voiced_frames += 1
                 trailing_frames = 0
@@ -543,7 +546,7 @@ def record_until_silence(min_ms: int = 0, pad_ms: int = 0) -> bytes:
                     pad_buffer.clear()
                 last_activity_ts = time.time()
             else:
-                if voiced:
+                if in_speech and voiced:
                     trailing_frames += 1
                     if max_pad_bytes and len(pad_buffer) < max_pad_bytes:
                         pad_buffer.extend(frame)
@@ -552,9 +555,11 @@ def record_until_silence(min_ms: int = 0, pad_ms: int = 0) -> bytes:
                         if silence_start is None:
                             silence_start = time.time()
                         elif time.time() - silence_start >= MAX_SILENCE_SECONDS:
+                            in_speech = False
                             return bytes(voiced + pad_buffer)
-                elif pre_buffer is not None:
-                    pre_buffer.append(frame)
+                else:
+                    if pre_buffer is not None:
+                        pre_buffer.append(frame)
 
         if time.time() - last_activity_ts > SESSION_IDLE_TIMEOUT:
             break
@@ -630,6 +635,7 @@ def synthesize_tts_piper(text: str) -> Optional[str]:
             log_event("tts_error", error=stderr.strip(), code=p.returncode)
             return None
         log_event("tts_synth", path=out_path, chars=len(text))
+        _prepend_tts_silence(out_path, INITIAL_TTS_SILENCE_MS)
         return out_path
     except Exception as e:
         print(f"[TTS] Piper error: {e}", file=sys.stderr)
@@ -639,6 +645,28 @@ def synthesize_tts_piper(text: str) -> Optional[str]:
             pass
         log_event("tts_error", error=str(e))
         return None
+
+def _prepend_tts_silence(path: str, ms: int) -> None:
+    if ms <= 0:
+        return
+    try:
+        with wave.open(path, "rb") as src:
+            params = src.getparams()
+            audio = src.readframes(params.nframes)
+        bytes_per_frame = params.sampwidth * params.nchannels
+        silent_frames = int(params.framerate * ms / 1000.0)
+        if silent_frames <= 0 or bytes_per_frame <= 0:
+            return
+        silence = b"\x00" * (silent_frames * bytes_per_frame)
+        fd, tmp_path = tempfile.mkstemp(prefix="voicebot_pad_", suffix=".wav")
+        os.close(fd)
+        with wave.open(tmp_path, "wb") as dst:
+            dst.setparams(params)
+            dst.writeframes(silence + audio)
+        shutil.move(tmp_path, path)
+        log_event("tts_pad", ms=ms)
+    except Exception as exc:
+        print(f"[TTS] silence prepend failed: {exc}", file=sys.stderr)
 
 def play_wav(path: str):
     dev = resolve_play_device()

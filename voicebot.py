@@ -30,7 +30,7 @@ import tempfile
 import shutil
 from collections import deque
 from pathlib import Path
-from typing import List, Dict, Optional, Callable, Tuple
+from typing import List, Dict, Optional, Callable, Tuple, Any, Pattern
 
 import numpy as np
 import webrtcvad
@@ -50,6 +50,23 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     rapidfuzz_fuzz = None
     rapidfuzz_lev = None
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_repo_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
+def _persona_config_path(persona_name: str, persona_path: str, personas_dir: Path) -> Optional[Path]:
+    if persona_path:
+        return _resolve_repo_path(persona_path)
+    if persona_name:
+        return (personas_dir / f"{persona_name.lower()}.json").resolve()
+    return None
 
 # ---------------- Config ----------------
 load_dotenv()
@@ -77,6 +94,12 @@ PRE_SPEECH_FRAMES     = max(0, int(round(PRE_SPEECH_BUFFER_MS / FRAME_MS)))
 USE_ALSA_CAPTURE      = os.getenv("USE_ALSA_CAPTURE", "1") == "1"
 ALSA_DEVICE           = os.getenv("ALSA_DEVICE", "").strip()        # e.g. "plughw:2,0" or "auto"
 VOICEBOT_PLAY_DEVICE  = os.getenv("VOICEBOT_PLAY_DEVICE", "").strip()
+
+# Persona
+PERSONA_NAME          = os.getenv("PERSONA_NAME", "").strip()
+PERSONA_PATH          = os.getenv("PERSONA_PATH", "").strip()
+_PERSONA_DIR_RAW      = os.getenv("PERSONA_DIR", os.getenv("PERSONAS_DIR", "personas")).strip() or "personas"
+PERSONAS_DIR          = _resolve_repo_path(_PERSONA_DIR_RAW)
 
 # ---- Wakeword & window ----
 REQUIRE_WAKEWORD      = os.getenv("REQUIRE_WAKEWORD", "0") == "1"
@@ -158,6 +181,49 @@ def log_event(event: str, **fields) -> None:
     else:
         meta = ", ".join(f"{k}={v}" for k, v in payload.items() if k != "event")
         logger.info("%s | %s", event, meta)
+
+
+def _apply_persona_overrides() -> None:
+    persona_cfg_path = _persona_config_path(PERSONA_NAME, PERSONA_PATH, PERSONAS_DIR)
+    if not persona_cfg_path:
+        return
+    if not persona_cfg_path.exists():
+        logger.warning("Persona config not found at %s", persona_cfg_path)
+        return
+    try:
+        persona = json.loads(persona_cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.error("Failed to load persona config %s: %s", persona_cfg_path, exc)
+        return
+
+    persona_label = persona.get("name") or PERSONA_NAME or persona_cfg_path.stem
+
+    global SYSTEM_PROMPT
+    prompt = persona.get("system_prompt")
+    if prompt:
+        SYSTEM_PROMPT = prompt
+
+    global PIPER_VOICE, PIPER_LENGTH_SCALE, PIPER_NOISE_SCALE, PIPER_NOISE_W, INITIAL_TTS_SILENCE_MS
+    voice_path = persona.get("voice") or persona.get("voice_path")
+    if voice_path:
+        PIPER_VOICE = str(_resolve_repo_path(voice_path))
+
+    voice_settings = persona.get("voice_settings") or {}
+    if "length_scale" in voice_settings:
+        PIPER_LENGTH_SCALE = str(voice_settings["length_scale"])
+    if "noise_scale" in voice_settings:
+        PIPER_NOISE_SCALE = str(voice_settings["noise_scale"])
+    if "noise_w" in voice_settings:
+        PIPER_NOISE_W = str(voice_settings["noise_w"])
+
+    silence_ms = persona.get("initial_tts_silence_ms")
+    if silence_ms is not None:
+        INITIAL_TTS_SILENCE_MS = int(silence_ms)
+
+    logger.info("Loaded persona '%s' from %s", persona_label, persona_cfg_path)
+
+
+_apply_persona_overrides()
 
 
 session_active: bool = False
@@ -723,6 +789,8 @@ def speak(text: str):
 
 # ---------------- Wakeword Matching ----------------
 _WAKE_FILLERS = ("hey", "hi", "uh", "um", "ok", "okay", "yo", "hello", "alright")
+_WAKE_BOUNDARY = r"[\s,.:;!?\"'()\-\u2014]+"
+_WAKE_TRAILING = r"[\s,.:;!?\"'()\-\u2014]*"
 _SENS_RATIO_DELTA = {"low": -5, "medium": 0, "high": 5}  # positive → stricter, negative → looser
 
 
@@ -787,6 +855,36 @@ def _strip_fillers(text: str) -> str:
     return " ".join(tokens)
 
 
+def _strip_leading_fillers(text: str) -> str:
+    if not text:
+        return ""
+    tokens = text.split()
+    idx = 0
+    while idx < len(tokens):
+        token = re.sub(r"[^a-z0-9]+", "", tokens[idx].lower())
+        if token in _WAKE_FILLERS:
+            idx += 1
+        else:
+            break
+    if idx == 0:
+        return text
+    return " ".join(tokens[idx:])
+
+
+def _compile_wake_regex(variant: str) -> Optional[Pattern[str]]:
+    variant = variant.strip()
+    if not variant:
+        return None
+    pieces = [re.escape(part) for part in variant.split()]
+    if not pieces:
+        return None
+    if len(pieces) == 1:
+        body = pieces[0]
+    else:
+        body = rf"{_WAKE_BOUNDARY.join(pieces)}"
+    return re.compile(rf"^\s*{body}{_WAKE_TRAILING}", re.IGNORECASE)
+
+
 def _match_wake(text: str, wake: str, sensitivity: str, aliases: List[str] | None = None) -> Tuple[bool, int, int]:
     nt = _strip_fillers(_norm(text))
     nw = _norm(wake)
@@ -817,15 +915,15 @@ def _match_wake(text: str, wake: str, sensitivity: str, aliases: List[str] | Non
 
 
 def _strip_wake(text: str, wake: str) -> str:
-    t = text.strip()
+    t = _strip_leading_fillers(text.strip())
     variants = _wake_variants()
     if wake and wake not in variants:
         variants.append(wake)
-    for variant in variants:
-        if not variant:
+    patterns = [_compile_wake_regex(v) for v in variants]
+    for pattern in patterns:
+        if not pattern:
             continue
-        pattern = re.compile(rf"^\s*{re.escape(variant)}[\s,.:;!?-]*", re.IGNORECASE)
-        stripped = re.sub(pattern, "", t, count=1).strip()
+        stripped = pattern.sub("", t, count=1).strip()
         if stripped != t:
             return stripped
     return t

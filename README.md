@@ -40,6 +40,12 @@ A local-first voice assistant tuned for the AIRHUG microphone/speaker stack. It 
 - `make calibrate` – guided VAD/noise calibration (records short samples).
 - `make lint` / `make format` – run Ruff.
 
+## Personas
+- Persona configs live under `personas/` and pair an Ollama system prompt with a Piper voice. Stock files: `tars`, `hal`, `cortana`, `bmo`.
+- Set `PERSONA_NAME=tars` (or another filename stem) in your `.env` to load that profile automatically. The loader overrides `SYSTEM_PROMPT`, `PIPER_VOICE`, the Piper tuning knobs, and `INITIAL_TTS_SILENCE_MS`.
+- Use `PERSONA_DIR` to point at a different folder, or `PERSONA_PATH=/abs/path/to/custom.json` for one-off experiments.
+- Create new personas by copying an existing JSON file and swapping the prompt + `voice` path. Keep paths relative to the repo when possible so collaborators share the same layout.
+
 ## Running Locally
 Launch an interactive session in the project root:
 ```bash

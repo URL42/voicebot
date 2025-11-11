@@ -52,6 +52,8 @@ except ImportError:  # pragma: no cover - optional dependency
     rapidfuzz_lev = None
 
 BASE_DIR = Path(__file__).resolve().parent
+ACTIVE_PERSONA_NAME: Optional[str] = None
+ACTIVE_PERSONA_PATH: Optional[Path] = None
 
 
 def _resolve_repo_path(raw_path: str) -> Path:
@@ -220,10 +222,27 @@ def _apply_persona_overrides() -> None:
     if silence_ms is not None:
         INITIAL_TTS_SILENCE_MS = int(silence_ms)
 
+    global ACTIVE_PERSONA_NAME, ACTIVE_PERSONA_PATH
+    ACTIVE_PERSONA_NAME = persona_label
+    ACTIVE_PERSONA_PATH = persona_cfg_path
     logger.info("Loaded persona '%s' from %s", persona_label, persona_cfg_path)
 
 
+def _log_persona_state() -> None:
+    persona = ACTIVE_PERSONA_NAME or "none"
+    voice = PIPER_VOICE or ""
+    dataset = {
+        "persona": persona,
+        "persona_path": str(ACTIVE_PERSONA_PATH) if ACTIVE_PERSONA_PATH else "",
+        "voice": voice,
+        "voice_exists": bool(voice and Path(voice).expanduser().exists()),
+        "override_source": "persona" if ACTIVE_PERSONA_NAME else "env",
+    }
+    log_event("persona_state", **dataset)
+
+
 _apply_persona_overrides()
+_log_persona_state()
 
 
 session_active: bool = False

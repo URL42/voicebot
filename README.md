@@ -45,6 +45,8 @@ A local-first voice assistant tuned for the AIRHUG microphone/speaker stack. It 
 - Set `PERSONA_NAME=tars` (or another filename stem) in your `.env` to load that profile automatically. The loader overrides `SYSTEM_PROMPT`, `PIPER_VOICE`, the Piper tuning knobs, and `INITIAL_TTS_SILENCE_MS`.
 - Use `PERSONA_DIR` to point at a different folder, or `PERSONA_PATH=/abs/path/to/custom.json` for one-off experiments.
 - Create new personas by copying an existing JSON file and swapping the prompt + `voice` path. Keep paths relative to the repo when possible so collaborators share the same layout.
+- `SYSTEM_PROMPT` remains available as an expert-only override, but it is intentionally omitted from `.env` so personas are the single source of truth.
+- Piper overrides are commented out in `.env`; uncomment `PIPER_VOICE`/friends only if you want to bypass the persona defaults temporarily.
 
 ## Running Locally
 Launch an interactive session in the project root:
